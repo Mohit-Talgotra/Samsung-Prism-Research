@@ -193,6 +193,43 @@ Each result file contains a single number (1-100) representing the image's signi
 - **Hyperbolic API**: Limited concurrent requests and image count per request. Can send at max. 4 images per api call.
 - **Hugging Face**: Rate limits may apply based on your subscription tier
 
+## Final Dataset File Structure
+
+```
+DatasetRoot/
+│
+├── Annotations/
+│   ├── train/
+│   │   ├── Amit Bhadana/
+│   │   ├── Ashish Chanchlani/
+│   │   ├── Brent Rivera/
+│   │   └── ...
+│   │
+│   ├── val/
+│   │   ├── Amit Bhadana/
+│   │   ├── Ashish Chanchlani/
+│   │   └── ...
+│   │
+│   └── test/
+│       ├── Amit Bhadana/
+│       ├── Ashish Chanchlani/
+│       └── ...
+│
+└── Data/
+    ├── train/
+    │   ├── Amit Bhadana/
+    │   ├── Ashish Chanchlani/
+    │   └── ...
+    │
+    ├── val/
+    │   ├── Amit Bhadana/
+    │   └── ...
+    │
+    └── test/
+        ├── Amit Bhadana/
+        └── ...
+```
+
 ## 🤝 Contributing
 
 1. Fork the repository
