@@ -7,6 +7,11 @@ from pathlib import Path
 import logging
 from datetime import datetime
 import time
+import re
+
+def is_valid_output(content):
+    content = content.strip()
+    return bool(re.fullmatch(r"\d+\.\d{2}", content))
 
 def find_family_faces_folder(directory):
     for item in os.listdir(directory):
@@ -37,6 +42,94 @@ def find_value_by_keyword(data, keyword):
         if keyword in key.lower():
             return value
     return None
+
+def load_report(report_path):
+    empty_files = []
+    invalid_files = []
+
+    mode = None
+
+    with open(report_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if line == "Empty files:":
+                mode = "empty"
+                continue
+            elif line == "Invalid files (not a single float):":
+                mode = "invalid"
+                continue
+            elif line == "Summary:":
+                break
+
+            if line:
+                if mode == "empty":
+                    empty_files.append(line)
+                elif mode == "invalid":
+                    invalid_files.append(line)
+
+    return empty_files, invalid_files
+
+def rerun_invalid_files(invalid_files, dataset_root, results_root, prompt_template, model):
+    dataset_root = Path(dataset_root)
+    results_root = Path(results_root)
+
+    # group files by event folder
+    event_map = {}
+
+    for file_path in invalid_files:
+        file_path = Path(file_path)
+
+        # delete the bad file
+        try:
+            file_path.unlink()
+            logging.info(f"Deleted: {file_path}")
+        except Exception as e:
+            logging.error(f"Failed to delete {file_path}: {e}")
+            continue
+
+        # reconstruct event folder path
+        # results_root / creator / event / file.txt
+        rel_path = file_path.relative_to(results_root)
+        parts = rel_path.parts
+
+        if len(parts) < 3:
+            continue
+
+        creator = parts[0]
+        event = parts[1]
+
+        event_folder = dataset_root / creator / event
+
+        if event_folder not in event_map:
+            event_map[event_folder] = []
+
+        event_map[event_folder].append(file_path.stem)
+
+    # rerun per event folder
+    for event_folder, image_names in event_map.items():
+        creator_folder = event_folder.parent
+
+        # find FamilyFaces folder
+        family_faces_folder = None
+        for item in creator_folder.iterdir():
+            if item.is_dir() and "FamilyFaces" in item.name:
+                family_faces_folder = str(item)
+                break
+
+        if not family_faces_folder:
+            logging.error(f"No FamilyFaces for {event_folder}")
+            continue
+
+        logging.info(f"Reprocessing event: {event_folder}")
+
+        process_event_folder(
+            str(event_folder),
+            family_faces_folder,
+            prompt_template,
+            model,
+            str(results_root / creator_folder.name)
+        )
 
 def process_event_folder(event_folder, family_faces_folder, prompt_template, model, results_base_dir):
     logging.info(f"Processing event: {os.path.basename(event_folder)}")
@@ -72,8 +165,14 @@ def process_event_folder(event_folder, family_faces_folder, prompt_template, mod
         
         # Skip if already processed
         if os.path.exists(output_path):
-            logging.warning(f"Skipping already processed: {image_name}")
-            continue
+            with open(output_path, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            
+            if is_valid_output(existing):
+                logging.warning(f"Skipping valid file: {image_name}")
+                continue
+            else:
+                logging.warning(f"Reprocessing invalid file: {image_name}")
         
         logging.info(f"Processing image: {os.path.basename(event_image_path)}")
         
@@ -90,7 +189,7 @@ def process_event_folder(event_folder, family_faces_folder, prompt_template, mod
         # the issue is because of vllm inference engine. rn I counldn't fina a way to pass in vllm params through their api
         # https://docs.hyperbolic.xyz/docs/rest-api#input-parameters
         # Add family face images (limit to 3 to stay within 4-image API limit)
-        family_images_to_use = family_images
+        family_images_to_use = family_images[:6]
         # Ensure we don't exceed the API limit (4 total images - 1 event image = 3 family images max)
         
         logging.warning(f"Using {len(family_images_to_use)} out of {len(family_images)} family face images")
@@ -129,15 +228,39 @@ def process_event_folder(event_folder, family_faces_folder, prompt_template, mod
         for idx, family_image_path in enumerate(family_images_to_use, start=2):
             logging.info(f"{idx} -> FAMILY: {family_image_path}")
         
-        try:
-            start_time = time.time()
-            result = call_ollama(model, context_prompt, images_to_process)
-            end_time = time.time()
-            
-            logging.info(f"API call completed in {end_time - start_time:.2f} seconds")
+        max_retries = 3
+        attempt = 0
+        result_content = ""
 
-        except Exception as e:
-            logging.exception(f"API call failed for image {event_image_path}")
+        while attempt < max_retries:
+            try:
+                start_time = time.time()
+                result = call_ollama(model, context_prompt, images_to_process)
+                end_time = time.time()
+                
+                logging.info(f"API call completed in {end_time - start_time:.2f} seconds (attempt {attempt+1})")
+
+            except Exception as e:
+                logging.exception(f"API call failed (attempt {attempt+1}) for image {event_image_path}")
+                attempt += 1
+                continue
+
+            if result:
+                result_content = result.get("response", "").strip()
+            else:
+                result_content = ""
+
+            # validate output
+            if result_content and is_valid_output(result_content):
+                break
+            else:
+                logging.warning(f"Invalid/empty output (attempt {attempt+1}): '{result_content}'")
+                attempt += 1
+                time.sleep(1)
+
+        # final check
+        if not result_content or not is_valid_output(result_content):
+            logging.error(f"Failed to get valid output after {max_retries} attempts for {event_image_path}")
             continue
 
         logging.info(f"API Response Keys: {list(result.keys()) if result else 'None'}")
@@ -209,7 +332,6 @@ def process_dataset(dataset_root, prompt_template, model="Qwen/Qwen2.5-VL-7B-Ins
                         str(creator_results_dir)
                     )
 
-
 def setup_logging(log_dir="logs"):
     os.makedirs(log_dir, exist_ok=True)
     
@@ -227,7 +349,6 @@ def setup_logging(log_dir="logs"):
     
     logging.info("Logging initialized")
     logging.info(f"Log file: {log_file}")
-
 
 def main(dataset_root=None, output_path=None):
     load_dotenv()
@@ -296,6 +417,16 @@ REMEMBER: Output ONLY the numerical score with two decimal places. Nothing else.
     # IMPORTANT: for qwen3-vl-2b-instruct, 8 total images is the limit before context overload
     model = "qwen3-vl:4b-instruct-q4_K_M"
     process_dataset(dataset_root, prompt_template, model, output_dir=output_path)
+    # empty_files, invalid_files = load_report("scan_report.txt")
+
+    # files_to_rerun = empty_files + invalid_files
+    # rerun_invalid_files(
+    #     files_to_rerun,
+    #     dataset_root=dataset_root,
+    #     results_root=output_path,
+    #     prompt_template=prompt_template,
+    #     model=model
+    # )
 
 if __name__ == "__main__":
     import argparse
@@ -306,4 +437,4 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    main(dataset_root=r"C:\Users\Admin\Desktop\25VI12VIT\Dataset\dataset", output_path="./Results")
+    main(dataset_root=r"C:\Mohit\Repositories\Samsung-Prism-Research\Dataset", output_path="./Results")
